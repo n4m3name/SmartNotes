@@ -5,7 +5,7 @@ from typing import Iterable, Tuple, Optional
 from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from smartnotes.models import Note, Meta
+from smartnotes.models import Note, Meta, Tag
 
 # Optional VADER sentiment; falls back to a tiny lexicon if unavailable.
 try:
@@ -107,3 +107,63 @@ async def enrich_missing(
         enriched += 1
 
     return enriched, skipped
+
+
+async def enrich_tags(
+    session: AsyncSession,
+    note_ids: Iterable[str] | None = None,
+    *,
+    overwrite: bool = True,
+    top_k: int = 5,
+) -> Tuple[int, int]:
+    """
+    Generate and persist tags for notes using the configured LLM provider (local/offline by default).
+    - If `note_ids` is None: process notes that currently have no tags.
+    - If `overwrite` is True: replace any existing tags for targeted notes.
+    Returns: (tagged_count, skipped_count)
+    """
+    from smartnotes.llm.factory import get_provider
+
+    prov = get_provider()
+    tagged = 0
+    skipped = 0
+
+    # Choose target notes
+    if note_ids:
+        targets = (
+            await session.execute(
+                select(Note).where(Note.id.in_(list(note_ids)))
+            )
+        ).scalars().all()
+    else:
+        # Notes that currently have no tags
+        targets = (
+            await session.execute(
+                select(Note).where(~Note.id.in_(select(Tag.note_id)))
+            )
+        ).scalars().all()
+
+    if not targets:
+        return 0, 0
+
+    for n in targets:
+        if overwrite:
+            await session.execute(delete(Tag).where(Tag.note_id == n.id))
+        else:
+            # If not overwriting and tags exist, skip
+            existing = (await session.execute(select(Tag).where(Tag.note_id == n.id))).first()
+            if existing is not None:
+                skipped += 1
+                continue
+        tags = prov.generate_tags(n.body_md or "", top_k=top_k) or []
+        # Deduplicate and persist
+        seen = set()
+        for t in tags:
+            t = (t or "").strip()
+            if not t or t in seen:
+                continue
+            seen.add(t)
+            session.add(Tag(note_id=n.id, tag=t))
+        tagged += 1
+
+    return tagged, skipped

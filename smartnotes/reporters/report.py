@@ -10,7 +10,8 @@ from typing import Any
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from smartnotes.models import Note, Meta, Tag
+from smartnotes.models import Note, Meta, Tag, Summary
+from smartnotes.llm.factory import get_provider
 
 
 @dataclass
@@ -138,6 +139,45 @@ def render_md(bundle: dict[str, Any]) -> str:
         lines.append("_(no notes in this window)_")
     lines.append("")
     return "\n".join(lines)
+
+
+def llm_overview(bundle: dict[str, Any]) -> str:
+    """
+    Produce a short natural-language overview of the reporting window using the configured provider.
+    Respects remote_allowed via provider factory (falls back to local offline summarizer).
+    """
+    prov = get_provider()
+    # Build a minimal text corpus: titles + top tags + counts
+    parts: list[str] = []
+    parts.append(f"Period: {bundle['period']}")
+    parts.append(f"Notes: {bundle['note_count']}")
+    if bundle.get("avg_sentiment") is not None:
+        parts.append(f"Mean sentiment: {bundle['avg_sentiment']:.3f}")
+    tags = ", ".join([t for (t, _) in (bundle.get("top_tags") or [])])
+    if tags:
+        parts.append(f"Top tags: {tags}")
+    titles = "; ".join([(row.get("title") or "(untitled)") for row in (bundle.get("notes") or [])])
+    if titles:
+        parts.append(f"Titles: {titles}")
+    text = "\n".join(parts)
+    return prov.generate_summary(text, max_sentences=5)
+
+
+async def save_period_summary(session: AsyncSession, bundle: dict[str, Any], summary_md: str) -> Summary:
+    """
+    Persist an LLM-generated overview into the Summary table (period-level cache).
+    """
+    row = Summary(
+        period=bundle["period"],
+        start_ts=bundle["start"],
+        end_ts=bundle["end"],
+        summary_md=summary_md,
+        topics_json={k: int(v) for (k, v) in (bundle.get("top_tags") or [])} or None,
+        mood_trend_json=None,
+        created_at=_utcnow(),
+    )
+    session.add(row)
+    return row
 
 
 def write_report(markdown: str, reports_dir: Path, period: str, start: datetime, end: datetime) -> Path:

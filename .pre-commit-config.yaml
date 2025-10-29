@@ -1,0 +1,13 @@
+repos:
+  - repo: local
+    hooks:
+      - id: pytest
+        name: pytest
+        entry: uv run pytest -q
+        language: system
+        pass_filenames: false
+      - id: smoke
+        name: smoke
+        entry: bash scripts/smoke.sh
+        language: system
+        pass_filenames: false

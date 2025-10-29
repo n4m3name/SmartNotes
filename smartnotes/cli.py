@@ -197,6 +197,26 @@ def enrich(ids: tuple[str, ...]):
             click.echo(f"Enriched: {added} (skipped: {skipped})")
 
     asyncio.run(go())
+@cli.command("enrich-tags")
+@click.option("--ids", multiple=True, help="Specific note IDs; default = all notes missing Tags.")
+@click.option("--top-k", default=5, show_default=True, help="Max tags to generate per note.")
+@click.option("--no-overwrite", is_flag=True, help="Do not overwrite existing tags; skip if present.")
+def enrich_tags_cmd(ids: tuple[str, ...], top_k: int, no_overwrite: bool):
+    """LLM-based tag enrichment; respects remote_allowed via provider selection."""
+    from smartnotes.services.enrich import enrich_tags
+
+    s = load_settings()
+
+    async def go():
+        eng, session_factory = make_engine(s.db_path)
+        await ensure_schema(eng)
+        async with session_factory() as session:
+            tagged, skipped = await enrich_tags(session, note_ids=ids or None, overwrite=not no_overwrite, top_k=top_k)
+            await session.commit()
+            click.echo(f"Tagged: {tagged} (skipped: {skipped})")
+
+    asyncio.run(go())
+
 
 
 # ---------------------------------------------------------------------
@@ -390,6 +410,38 @@ def report_cmd(period: str):
 
     asyncio.run(go())
 
+
+@cli.command("summarize")
+@click.option("--id", "note_id", required=True, help="Note ID to summarize.")
+@click.option("--sentences", default=5, show_default=True, help="Max sentences in the summary.")
+@click.option("--write", "write_out", is_flag=True, help="Write to reports/summaries/<id>.md instead of stdout.")
+def summarize_cmd(note_id: str, sentences: int, write_out: bool) -> None:
+    """Summarize a note using the configured LLM provider (respects remote_allowed)."""
+    from sqlalchemy import select
+    from smartnotes.models import Note
+    from smartnotes.llm.factory import get_provider
+
+    s = load_settings()
+    prov = get_provider()
+
+    async def go():
+        eng, sf = make_engine(s.db_path)
+        await ensure_schema(eng)
+        async with sf() as session:
+            row = (await session.execute(select(Note).where(Note.id == note_id))).scalar_one_or_none()
+            if row is None:
+                raise click.ClickException(f"No note found with id: {note_id}")
+            summary = prov.generate_summary(row.body_md or "", max_sentences=sentences)
+        if write_out:
+            out_dir = (s.reports_dir / "summaries").expanduser()
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out = out_dir / f"{note_id}.md"
+            out.write_text(f"# Summary for {note_id}\n\n{summary}\n", encoding="utf-8")
+            click.echo(f"Wrote {out}")
+        else:
+            click.echo(summary)
+
+    asyncio.run(go())
 
 
 # allow `uv run -m smartnotes.cli ...` and console entry point
