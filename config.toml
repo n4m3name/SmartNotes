@@ -1,0 +1,7 @@
+notes_dir = "~/Documents/ReflectiveNotes"
+archive_dir = "~/Documents/ReflectiveNotes/archive"
+reports_dir = "~/Documents/ReflectiveNotes/reports"
+vec_model = "all-MiniLM-L6-v2"
+remote_allowed = false
+llm_backend = "local"
+report_times = { daily = "23:00", weekly = "Sun 18:00", monthly = "1 18:00" }
