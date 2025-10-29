@@ -10,6 +10,13 @@ from smartnotes.config import load_settings
 from smartnotes.db import make_engine
 from smartnotes.services.enrich import enrich_missing
 from smartnotes.services.embeddings import build_or_rebuild
+from smartnotes.log import logger
+
+def log(msg: str):
+    logger.info(msg)
+
+
+
 # If you added the report command earlier:
 try:
     from smartnotes.reporters.report import collect, render_md, write_report

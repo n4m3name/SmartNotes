@@ -1,6 +1,8 @@
+# smartnotes/cli.py
 from __future__ import annotations
+
 import asyncio
-import shutil
+import os
 from pathlib import Path
 import click
 
@@ -8,17 +10,86 @@ from smartnotes.config import load_settings
 from smartnotes.db import make_engine, ensure_schema
 from smartnotes.services.ingest import safe_move_to_archive
 
+from smartnotes.log import setup_logging
+setup_logging()
+
+
+# optional reporters
+try:
+    from smartnotes.reporters.report import collect, render_md, write_report
+except Exception:
+    collect = render_md = write_report = None  # reports optional
+
+
 
 @click.group()
 def cli():
     """SmartNotes CLI — local-first notes agent."""
 
 
-# ----- basics -----
+# ---------------------------------------------------------------------
+# init (Step 5): create default config + directories
+# ---------------------------------------------------------------------
+# Try to use config's canonical path if exported; else default to ~/.config
+try:
+    from smartnotes.config import DEFAULT_CONFIG_PATH as _CFG_DEFAULT
+except Exception:
+    _CFG_DEFAULT = "~/.config/smartnotes/config.toml"
 
+
+@cli.command("init")
+@click.option("--force", is_flag=True, help="Overwrite existing config.toml if present.")
+def init_command(force: bool) -> None:
+    """Create a default config.toml and the notes/archive/reports directories."""
+    try:
+        import tomli_w  # type: ignore
+    except Exception as e:
+        raise click.ClickException(
+            "tomli_w is required for 'smart init'. Install it with: uv add tomli_w"
+        ) from e
+
+    cfg_path = Path(_CFG_DEFAULT).expanduser()
+    cfg_dir = cfg_path.parent
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+
+    default = {
+        "notes_dir": "~/Documents/ReflectiveNotes",
+        "archive_dir": "~/Documents/ReflectiveNotes/archive",
+        "reports_dir": "~/Documents/ReflectiveNotes/reports",
+        "vec_model": "all-MiniLM-L6-v2",
+        "remote_allowed": False,
+        "llm_backend": "local",  # local | openai | anthropic | gemini
+        "report_times": {"daily": "23:00", "weekly": "Sun 18:00", "monthly": "1 18:00"},
+    }
+
+    if cfg_path.exists() and not force:
+        click.echo(f"Config already exists at {cfg_path} (use --force to overwrite).")
+    else:
+        with open(cfg_path, "wb") as f:
+            tomli_w.dump(default, f)
+        click.echo(f"Wrote default config to {cfg_path}")
+
+    # Create directories based on the just-written defaults
+    notes_dir = Path(default["notes_dir"]).expanduser()
+    archive_dir = Path(default["archive_dir"]).expanduser()
+    reports_dir = Path(default["reports_dir"]).expanduser()
+    for d in (notes_dir, archive_dir, reports_dir, notes_dir / ".smartnotes"):
+        d.mkdir(parents=True, exist_ok=True)
+
+    click.echo("Created directories:")
+    click.echo(f"  - {notes_dir}")
+    click.echo(f"  - {archive_dir}")
+    click.echo(f"  - {reports_dir}")
+    click.echo(f"  - {notes_dir / '.smartnotes'}")
+    click.echo("Done.")
+
+
+# ---------------------------------------------------------------------
+# basics
+# ---------------------------------------------------------------------
 @cli.command()
 def initdb():
-    """Show DB path (migrations create schema)."""
+    """Show DB path (schema will auto-create on first use)."""
     s = load_settings()
     click.echo(f"DB: {s.db_path}")
 
@@ -31,6 +102,7 @@ def ping():
     eng, _ = make_engine(s.db_path)
 
     async def go():
+        await ensure_schema(eng)
         async with eng.connect() as conn:
             out = (await conn.execute(text("SELECT 1"))).scalar_one()
             click.echo(f"DB ok: {out}")
@@ -38,8 +110,9 @@ def ping():
     asyncio.run(go())
 
 
-# ----- ingest -----
-
+# ---------------------------------------------------------------------
+# ingest
+# ---------------------------------------------------------------------
 @cli.command()
 @click.option("--dry-run", is_flag=True, help="Only list actions; no DB writes or moves.")
 @click.option("--archive/--no-archive", default=True, help="Move ingested files to archive/ on success.")
@@ -64,6 +137,7 @@ def ingest(dry_run: bool, archive: bool):
 
     async def go():
         eng, session_factory = make_engine(s.db_path)
+        await ensure_schema(eng)
         added = skipped = 0
         async with session_factory() as session:
             for p in files:
@@ -88,8 +162,9 @@ def ingest(dry_run: bool, archive: bool):
     asyncio.run(go())
 
 
-# ----- enrichment -----
-
+# ---------------------------------------------------------------------
+# enrichment
+# ---------------------------------------------------------------------
 @cli.command()
 @click.option("--ids", multiple=True, help="Specific note IDs; default = all notes missing Meta.")
 def enrich(ids: tuple[str, ...]):
@@ -100,6 +175,7 @@ def enrich(ids: tuple[str, ...]):
 
     async def go():
         eng, session_factory = make_engine(s.db_path)
+        await ensure_schema(eng)
         async with session_factory() as session:
             added, skipped = await enrich_missing(session, note_ids=ids or None)
             await session.commit()
@@ -108,19 +184,20 @@ def enrich(ids: tuple[str, ...]):
     asyncio.run(go())
 
 
-# ----- embeddings & search -----
-
+# ---------------------------------------------------------------------
+# embeddings & search
+# ---------------------------------------------------------------------
 @cli.command()
 @click.option("--model", default=None, help="SentenceTransformer model (default: vec_model from config.toml).")
 def embed(model: str | None):
-    """Rebuild embeddings index from all notes."""
-    from smartnotes.db import make_engine
+    """Build or update the embeddings index from all notes."""
     from smartnotes.services.embeddings import build_or_rebuild
     s = load_settings()
     model_name = model or s.vec_model
 
     async def go():
         eng, session_factory = make_engine(s.db_path)
+        await ensure_schema(eng)
         async with session_factory() as session:
             n, d = await build_or_rebuild(session, model_name)
             await session.commit()
@@ -150,21 +227,22 @@ def search(q: tuple[str, ...], k: int, model: str | None):
     for nid, score in results:
         click.echo(f"{score:6.3f}  {nid}")
 
-# ----- automation -----
 
+# ---------------------------------------------------------------------
+# automation
+# ---------------------------------------------------------------------
 @cli.command()
 def watch():
     """Watch notes_dir/new and auto-ingest → enrich → embed."""
     from smartnotes.services.watcher import run_watch
     run_watch()
 
+
 @cli.command()
 def schedule():
     """Run background scheduler (nightly refresh; weekly report)."""
     from smartnotes.services.scheduler import run_scheduler
     run_scheduler()
-
-
 
 
 @cli.command("rebuild-index")
@@ -184,7 +262,69 @@ def rebuild_index() -> None:
     asyncio.run(go())
 
 
+@cli.command("ensure-indexes")
+def ensure_indexes() -> None:
+    """
+    Create recommended indexes if they don't exist (safe for existing SQLite DBs).
+    """
+    from sqlalchemy import text
 
-# allow `uv run -m smartnotes.cli ...`
+    s = load_settings()
+    eng, _ = make_engine(s.db_path)
+
+    async def go():
+        await ensure_schema(eng)
+        stmts = [
+            # created_at is common in time-window queries
+            "CREATE INDEX IF NOT EXISTS ix_notes_created_at ON notes (created_at)",
+            # tag faceting / filtering
+            "CREATE INDEX IF NOT EXISTS ix_tags_tag ON tags (tag)",
+        ]
+        async with eng.begin() as conn:
+            for sql in stmts:
+                await conn.execute(text(sql))
+        click.echo("Indexes ensured: ix_notes_created_at, ix_tags_tag")
+
+    asyncio.run(go())
+
+
+
+@cli.command("report")
+@click.option(
+    "--period",
+    type=click.Choice(["daily", "weekly", "monthly"], case_sensitive=False),
+    default="daily",
+    show_default=True,
+    help="Reporting window.",
+)
+def report_cmd(period: str):
+    """
+    Generate a Markdown report for the selected period and write it into reports/.
+    Requires optional reporters module.
+    """
+    if not (collect and render_md and write_report):
+        raise click.ClickException(
+            "Reporting not available (smartnotes.reporters.report not installed)."
+        )
+
+    from datetime import datetime, timezone
+    s = load_settings()
+
+    async def go():
+        eng, session_factory = make_engine(s.db_path)
+        await ensure_schema(eng)
+        now_utc = datetime.now(timezone.utc)
+        async with session_factory() as session:
+            bundle = await collect(session, period, now_utc=now_utc)
+            md = render_md(bundle)
+            path = write_report(md, s.reports_dir, bundle["period"], bundle["start"], bundle["end"])
+            await session.commit()
+            click.echo(f"Wrote {period} report → {path}")
+
+    asyncio.run(go())
+
+
+
+# allow `uv run -m smartnotes.cli ...` and console entry point
 if __name__ == "__main__":
     cli()

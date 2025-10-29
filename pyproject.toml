@@ -6,19 +6,15 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "aiosqlite>=0.21.0",
-    "alembic>=1.17.1",
     "apscheduler>=3.11.0",
     "click>=8.3.0",
     "faiss-cpu>=1.12.0",
-    "fastapi>=0.120.1",
     "numpy>=2.3.4",
-    "pydantic>=2.12.3",
     "pydantic-settings>=2.11.0",
     "sentence-transformers>=5.1.2",
     "sqlalchemy>=2.0.44",
     "tomli>=2.3.0",
-    "uvicorn[standard]>=0.38.0",
-    "vadersentiment>=3.3.2",
+    "tomli-w>=1.2.0",
     "watchdog>=6.0.0",
 ]
 

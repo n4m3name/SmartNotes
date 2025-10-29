@@ -4,28 +4,18 @@ from __future__ import annotations
 from datetime import datetime
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy import (
-    String,
-    Text,
-    Integer,
-    Float,
-    DateTime,
-    ForeignKey,
-    UniqueConstraint,
-    JSON,
+    String, Text, Integer, Float, DateTime, ForeignKey, UniqueConstraint, JSON, Index
 )
 
-# ---------------------------------------------------------------------
-# Declarative base
-# ---------------------------------------------------------------------
 class Base(DeclarativeBase):
     pass
 
 
-# ---------------------------------------------------------------------
-# Tables
-# ---------------------------------------------------------------------
 class Note(Base):
     __tablename__ = "notes"
+    __table_args__ = (
+        Index("ix_notes_created_at", "created_at"),
+    )
 
     id: Mapped[str] = mapped_column(String, primary_key=True)
     path: Mapped[str] = mapped_column(String, nullable=False, unique=True)
@@ -38,7 +28,6 @@ class Note(Base):
 
 class Summary(Base):
     __tablename__ = "summaries"
-
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     period: Mapped[str] = mapped_column(String, nullable=False)  # daily | weekly | monthly
     start_ts: Mapped[datetime] = mapped_column(DateTime, nullable=False)
@@ -51,7 +40,6 @@ class Summary(Base):
 
 class Entity(Base):
     __tablename__ = "entities"
-
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     note_id: Mapped[str] = mapped_column(String, ForeignKey("notes.id", ondelete="CASCADE"), nullable=False)
     label: Mapped[str] = mapped_column(String, nullable=False)
@@ -75,7 +63,6 @@ class Link(Base):
 
 class Meta(Base):
     __tablename__ = "meta"
-
     note_id: Mapped[str] = mapped_column(String, ForeignKey("notes.id", ondelete="CASCADE"), primary_key=True)
     sentiment: Mapped[float | None] = mapped_column(Float, nullable=True)
     mood: Mapped[str | None] = mapped_column(String, nullable=True)
@@ -85,6 +72,9 @@ class Meta(Base):
 
 class Tag(Base):
     __tablename__ = "tags"
+    __table_args__ = (
+        Index("ix_tags_tag", "tag"),
+    )
 
     note_id: Mapped[str] = mapped_column(String, ForeignKey("notes.id", ondelete="CASCADE"), primary_key=True)
     tag: Mapped[str] = mapped_column(String, primary_key=True)
