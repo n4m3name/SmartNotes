@@ -98,24 +98,36 @@ def ingest_file_prepare(path: Path) -> IngestResult:
 
 # -------- DB upsert --------
 
-async def upsert_note(session: AsyncSession, r: IngestResult) -> bool:
+async def upsert_note(session: AsyncSession, r: IngestResult) -> str:
     """
-    Insert into notes if not present (matching by id OR unique path).
-    Returns True if inserted, False if pre-existing.
+    Insert or update a note by unique path.
+    - If a note with the same path exists and content differs → update fields (id remains stable).
+    - If no note exists with that path → insert a new row.
+    - If identical content already present → skip.
+    Returns one of: "inserted" | "updated" | "skipped".
     """
-    # 1) Try by primary key (id)
-    existing = await session.get(Note, r.note_id)
-    if existing is not None:
+    # First: if a note with the same content-hash id exists, we consider it unchanged
+    existing_by_id = await session.get(Note, r.note_id)
+    if existing_by_id is not None:
         r.inserted = False
-        return False
+        return "skipped"
 
-    # 2) Try by unique path
-    q = await session.execute(select(Note.id).where(Note.path == str(r.path)))
-    if q.scalar_one_or_none() is not None:
+    # Prefer matching by unique path next
+    row = (await session.execute(select(Note).where(Note.path == str(r.path)))).scalar_one_or_none()
+    if row is not None:
+        # Check if content differs (simple body comparison). Title/word_count naturally follow body.
+        if (row.body_md or "") == (r.body_md or ""):
+            r.inserted = False
+            return "skipped"
+        # Update fields; keep original id and created_at to preserve identity and history
+        row.title = r.title
+        row.body_md = r.body_md
+        row.word_count = r.word_count
+        row.ingested_at = datetime.now(timezone.utc).replace(tzinfo=None)
         r.inserted = False
-        return False
+        return "updated"
 
-    # 3) Insert
+    # No existing path: insert new
     session.add(
         Note(
             id=r.note_id,
@@ -127,8 +139,5 @@ async def upsert_note(session: AsyncSession, r: IngestResult) -> bool:
             word_count=r.word_count,
         )
     )
-
-
-    
     r.inserted = True
-    return True
+    return "inserted"

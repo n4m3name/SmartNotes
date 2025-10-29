@@ -59,6 +59,7 @@ def init_command(force: bool) -> None:
         "vec_model": "all-MiniLM-L6-v2",
         "remote_allowed": False,
         "llm_backend": "local",  # local | openai | anthropic | gemini
+        # Scheduling defaults; you can add an optional "weekly_full" like "Sun 17:30"
         "report_times": {"daily": "23:00", "weekly": "Sun 18:00", "monthly": "1 18:00"},
     }
 
@@ -89,9 +90,16 @@ def init_command(force: bool) -> None:
 # ---------------------------------------------------------------------
 @cli.command()
 def initdb():
-    """Show DB path (schema will auto-create on first use)."""
+    """Create (or update) the database schema and show the DB path."""
     s = load_settings()
-    click.echo(f"DB: {s.db_path}")
+    eng, _ = make_engine(s.db_path)
+
+    async def go():
+        # Ensure schema via central helper (idempotent)
+        await ensure_schema(eng)
+        click.echo(f"DB ready: {s.db_path}")
+
+    asyncio.run(go())
 
 
 @cli.command()
@@ -143,18 +151,25 @@ def ingest(dry_run: bool, archive: bool):
             for p in files:
                 res = ingest_file_prepare(p)
                 if dry_run:
-                    click.echo(f"WOULD ADD: {p.name}  →  {res.note_id}  ({res.word_count} words)")
+                    click.echo(f"WOULD UPSERT: {p.name}  →  {res.note_id}  ({res.word_count} words)")
                     continue
-                inserted = await upsert_note(session, res)
-                if inserted:
+                status = await upsert_note(session, res)
+                if status == "inserted":
                     added += 1
                     click.echo(f"ADDED: {p.name}  →  {res.note_id}")
                     if archive:
                         final = safe_move_to_archive(p, arch_dir)
                         click.echo(f"ARCHIVED: {final.name}")
+                elif status == "updated":
+                    click.echo(f"UPDATED: {p.name}")
+                    try:
+                        from smartnotes.services.embeddings import mark_dirty
+                        mark_dirty()
+                    except Exception:
+                        pass
                 else:
                     skipped += 1
-                    click.echo(f"SKIP (exists): {p.name}")
+                    click.echo(f"SKIP (no change): {p.name}")
             if not dry_run:
                 await session.commit()
         click.echo(f"Done: {added} added, {skipped} skipped.")
@@ -189,9 +204,11 @@ def enrich(ids: tuple[str, ...]):
 # ---------------------------------------------------------------------
 @cli.command()
 @click.option("--model", default=None, help="SentenceTransformer model (default: vec_model from config.toml).")
-def embed(model: str | None):
+@click.option("--if-dirty", is_flag=True, help="Do a full rebuild only if the dirty flag is set; otherwise incremental.")
+@click.option("--full", is_flag=True, help="Force a full rebuild of the index.")
+def embed(model: str | None, if_dirty: bool, full: bool):
     """Build or update the embeddings index from all notes."""
-    from smartnotes.services.embeddings import build_or_rebuild
+    from smartnotes.services.embeddings import build_or_rebuild, is_dirty, clear_dirty
     s = load_settings()
     model_name = model or s.vec_model
 
@@ -199,9 +216,24 @@ def embed(model: str | None):
         eng, session_factory = make_engine(s.db_path)
         await ensure_schema(eng)
         async with session_factory() as session:
-            n, d = await build_or_rebuild(session, model_name)
+            # Decide rebuild mode
+            if full:
+                incremental = False
+            elif if_dirty:
+                incremental = not is_dirty()
+            else:
+                incremental = True
+
+            n, d = await build_or_rebuild(session, model_name, incremental=incremental)
             await session.commit()
-            click.echo(f"Indexed {n} notes @ dim {d} → vecstore/index.faiss")
+            mode = "incremental" if incremental else "full"
+            # Clear dirty after full rebuild
+            if not incremental:
+                try:
+                    clear_dirty()
+                except Exception:
+                    pass
+            click.echo(f"Indexed {n} notes @ dim {d} ({mode}) → vecstore/index.faiss")
 
     asyncio.run(go())
 
@@ -287,6 +319,41 @@ def ensure_indexes() -> None:
 
     asyncio.run(go())
 
+
+@cli.command("doctor")
+@click.option("--json", "as_json", is_flag=True, help="Output JSON summary.")
+def doctor_cmd(as_json: bool) -> None:
+    """Run diagnostics: config, DB schema, vecstore integrity, and dirty flag."""
+    import json as _json
+    from smartnotes.doctor import run_checks
+
+    async def go():
+        res = await run_checks()
+        if as_json:
+            click.echo(_json.dumps(res.to_dict(), indent=2))
+            return
+        # Pretty text output
+        click.echo("SmartNotes Doctor\n------------------")
+        click.echo(f"OK: {res.ok}")
+        if res.errors:
+            click.echo("Errors:")
+            for e in res.errors:
+                click.echo(f"  - {e}")
+        if res.warnings:
+            click.echo("Warnings:")
+            for w in res.warnings:
+                click.echo(f"  - {w}")
+        # Select a few helpful details
+        d = res.details
+        click.echo("Details:")
+        for k in [
+            "config.notes_dir","config.archive_dir","config.reports_dir","config.vec_model",
+            "db.tables","db.ping","vecstore.dir","vecstore.exists","vecstore.ntotal","vecstore.ids_count","vecstore.dirty"
+        ]:
+            if k in d:
+                click.echo(f"  {k}: {d[k]}")
+
+    asyncio.run(go())
 
 
 @cli.command("report")

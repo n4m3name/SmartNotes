@@ -12,7 +12,7 @@ from smartnotes.config import load_settings
 from smartnotes.db import make_engine
 from smartnotes.services.ingest import discover_new_notes, ingest_file_prepare, upsert_note
 from smartnotes.services.enrich import enrich_missing
-from smartnotes.services.embeddings import build_or_rebuild
+from smartnotes.services.embeddings import build_or_rebuild, mark_dirty, clear_dirty
 from smartnotes.services.ingest import safe_move_to_archive
 
 
@@ -62,14 +62,21 @@ class _Handler(FileSystemEventHandler):
             # INGEST --------------------------------------------------------
             async with session_factory() as session:
                 added = 0
+                updated = 0
                 for p in files:
                     try:
                         r = ingest_file_prepare(p)
-                        if await upsert_note(session, r):
+                        status = await upsert_note(session, r)
+                        if status == "inserted":
                             added += 1
                             final = safe_move_to_archive(p, self.archive_dir)
                             log(f"Archived: {final.name}")
                             log(f"Ingested: {p.name}")
+                        elif status == "updated":
+                            updated += 1
+                            log(f"Updated: {p.name}")
+                        else:
+                            log(f"Skip (no change): {p.name}")
                     except Exception as e:
                         log(f"⚠️  Error ingesting {p.name}: {e}")
                         traceback.print_exc()
@@ -84,10 +91,20 @@ class _Handler(FileSystemEventHandler):
                     log("Enrichment done.")
 
             # EMBEDDINGS -----------------------------------------------------
+            # mark dirty if any updates occurred
+            if updated:
+                mark_dirty()
             async with session_factory() as session:
-                n_total, dim = await build_or_rebuild(session, self.vec_model, incremental=True)
+                # Use dirty flag to decide rebuild mode
+                from smartnotes.services.embeddings import is_dirty
+                incremental = not is_dirty()
+                n_total, dim = await build_or_rebuild(session, self.vec_model, incremental=incremental)
                 await session.commit()
-                log(f"Embedding index updated — {n_total} notes total @ dim {dim}.")
+                # Clear dirty after a full rebuild
+                mode = "incremental" if incremental else "full"
+                if not incremental:
+                    clear_dirty()
+                log(f"Embedding index ({mode}) — {n_total} notes total @ dim {dim}.")
 
         except Exception as e:
             log(f"❌ Watcher run failed: {e}")
